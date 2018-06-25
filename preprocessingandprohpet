@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Jun 22 09:32:00 2018
+
+@author: tidyquantpc
+"""
+
+#Importing the libaries#
+import numpy as np 
+import pandas as pd
+import seaborn as sns
+import matplotlib 
+from matplotlib import pyplot as plt
+%matplotlib inline
+from itertools import product
+
+#Load the Datasets#
+sales=pd.read_csv("sales_train_v2.csv")
+items=pd.read_csv("items-translated.csv")
+items_2=pd.read_csv("items.csv")
+cat = pd.read_csv("item_categories-translated.csv")
+cat_2 = pd.read_csv("item_categories.csv")
+shops = pd.read_csv("shops-translated.csv")
+#Changing Columns to account for translations#
+items= pd.merge(items, items_2, how='inner', on='item_id')
+items.drop(columns=['item_name'], inplace=True)
+del items_2
+del cat_2
+shops.columns =  ('shop_id','shop_name')
+cat.columns =  ('item_category_id','item_category_name')
+items.columns = ('item_id', ' item_name', 'item_category_id' )
+
+                                    ##########DATA PREPROCESSING############
+
+
+#Dropping duplicate values from the trainign set, keeping its first occurance#
+sales.drop_duplicates(subset=['date', 'date_block_num', 'shop_id', 'item_id', 'item_cnt_day'], 
+                      keep='first', inplace=True) 
+
+print(sales.item_price.min()) 
+print(sales.item_price.max()) 
+print(sales.item_price.mean())
+print(sales.item_price.median())
+print(sales.item_price.value_counts().sort_index(ascending=False)) 
+#Since -1 and 307980 look like outliers, they will be deleted# 
+sales = sales[(sales.item_price > 0) & (sales.item_price < 300000)]
+
+#Resetting the data index after duplicates and outliers were dropped#
+sales.reset_index(drop=True, inplace=True) 
+
+
+# Joining datasets
+sales_full = pd.merge(sales, items, how='left', on=['item_id'])
+sales_full = pd.merge(sales_full, cat, how='left', on=['item_category_id'])
+sales_full = pd.merge(sales_full, shops, how='left', on=['shop_id'])
+sales_full.head()
+
+
+                                    ############Feature Engineering##########
+# Adding date features
+sales_full['date'] = pd.to_datetime(sales_full['date'], format='%d.%m.%Y')
+sales_full['month'] = sales_full['date'].dt.month
+sales_full['year'] = sales_full['date'].dt.year
+
+# Adding revenue feature
+sales_full['revenue'] = sales_full.item_price * sales_full.item_cnt_day
+sales_full.head()
+
+##Adding Boolean Holiday Values##
+sales_full['December'] = sales_full.date_block_num.apply(lambda x: 1 if x ==23 else 0)
+sales_full['Newyear_Xmas'] = sales_full.date_block_num.apply(lambda x: 1 if x in [12,24] else 0)
+sales_full['Valentine_MenDay'] = sales_full.date_block_num.apply(lambda x: 1 if x in [13,25] else 0)
+sales_full['WomenDay'] = sales_full.date_block_num.apply(lambda x: 1 if x in [14,26] else 0)
+sales_full['Easter_Labor'] = sales_full.date_block_num.apply(lambda x: 1 if x in [15,27] else 0)
+
+
+sales_shop = sales_full.groupby(['shop_id', 'date_block_num'],as_index=False).agg({'item_cnt_day':{'shop_block_target_sum':'sum','shop_block_target_mean':np.mean}})
+sales_shop.columns = [col[0] if col[-1]=='' else col[-1] for col in sales_shop.columns.values]
+sales_new = pd.merge(sales_shop, sales_full, how='left', on=['shop_id', 'date_block_num']).fillna(0)
+sales_items = sales_full.groupby(['item_id', 'date_block_num'],as_index=False).agg({'item_cnt_day':{'item_block_target_sum':'sum','item_block_target_mean':np.mean}})
+sales_items.columns = [col[0] if col[-1]=='' else col[-1] for col in sales_items.columns.values]
+sales_new = pd.merge(sales_items, sales_new, how='left', on=['item_id', 'date_block_num']).fillna(0)
+sales_cat = sales_full.groupby(['item_category_id', 'date_block_num'],as_index=False).agg({'item_cnt_day':{'item_cat_block_target_sum':'sum','item_cat_block_target_mean':np.mean}})
+sales_cat.columns = [col[0] if col[-1]=='' else col[-1] for col in sales_cat.columns.values]
+sales_new = pd.merge(sales_new, sales_cat, how='left', on=['item_category_id', 'date_block_num']).fillna(0)
+sales_new.info()
+
+del sales_new['item_block_target_sum_y']
+del sales_new['item_block_target_mean_y']
+sales_new = sales_new.rename(columns={'item_block_target_sum_x': 'item_block_target_sum', 'item_block_target_mean_x': 'item_block_target_mean', ' item_name':'item_name'})
+sales_new.head()
+
+
+from fbprophet import Prophet
+proph = sales_new.groupby(['date_block_num'])[ 'item_cnt_day'].sum()
+proph.index=pd.date_range(start='2013-01-01', end='2015-10-01', freq='MS')
+proph = proph.to_frame().reset_index()
+proph.columns = ['ds', 'y']
+proph.head()
+model=Prophet(yearly_seasonality=True, interval_width=4)
+model.fit(proph)
+future_data = model.make_future_dataframe(periods=5, freq='MS')
+forecast_data = model.predict(future_data)
+forecast = model.predict(future_data)
+forecast[['ds', 'yhat', 'yhat_lower', 'yhat_upper']].tail()
+model.plot(forecast_data)
+model.plot_components(forecast_data)
+
+from fbprophet.diagnostics import cross_validation
+def mean_absolute_percentage_error(y_true, y_pred):
+      y_true, y_pred = np.array(y_true), np.array(y_pred)
+      return np.mean(np.abs((y_true - y_pred) / y_true)) * 100
+  
+
